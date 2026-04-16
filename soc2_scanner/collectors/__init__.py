@@ -16,6 +16,7 @@ __all__ = [
     "collect_ssm",
     "collect_vpc",
     "collect_waf",
+    "gcp",
 ]
 
 from soc2_scanner.collectors.access_analyzer import collect_access_analyzer
@@ -35,3 +36,4 @@ from soc2_scanner.collectors.securityhub import collect_securityhub
 from soc2_scanner.collectors.ssm import collect_ssm
 from soc2_scanner.collectors.vpc import collect_vpc
 from soc2_scanner.collectors.waf import collect_waf
+from soc2_scanner.collectors import gcp

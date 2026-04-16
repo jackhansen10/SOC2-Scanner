@@ -2,3 +2,5 @@ boto3
 pandas
 pyyaml
 reportlab
+google-api-python-client
+google-auth

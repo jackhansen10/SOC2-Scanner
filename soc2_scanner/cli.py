@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from typing import Any, Dict, List
 
 from soc2_scanner.scanner import ScanConfig, run_scan
@@ -61,6 +62,8 @@ def _merge_cli_config(args: argparse.Namespace) -> Dict[str, Any]:
         config["all_accounts"] = True
     _set_if(args.role_name, "role_name")
     _set_if(args.external_id, "external_id")
+    _set_if(args.provider, "provider")
+    _set_if(args.project_id, "project_id")
     if args.simulate:
         config["simulate"] = True
     if args.external_ids:
@@ -120,6 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a simulated scan without AWS API calls",
     )
+    parser.add_argument(
+        "--provider",
+        choices=["aws", "gcp"],
+        help="Cloud provider to scan (default: aws)",
+    )
+    parser.add_argument(
+        "--project-id",
+        help="GCP project ID to scan (falls back to default credentials project)",
+    )
     return parser
 
 
@@ -146,6 +158,8 @@ def main() -> None:
         external_id=merged.get("external_id"),
         external_ids=_validate_external_ids(merged.get("external_ids")),
         simulate=bool(merged.get("simulate")),
+        provider=(merged.get("provider") or "aws").lower(),
+        project_id=merged.get("project_id"),
     )
 
     result = run_scan(config)

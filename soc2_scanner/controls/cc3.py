@@ -2,12 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from soc2_scanner.collectors import (
-    collect_guardduty,
-    collect_inspector,
-    collect_securityhub,
-)
-from soc2_scanner.controls.context import EvidenceContext, get_cached
+from soc2_scanner.controls.context import EvidenceContext, collect
 
 
 CONTROL_ID = "CC3"
@@ -20,15 +15,9 @@ SOURCES = ["Security Hub", "GuardDuty", "Inspector"]
 
 
 def evaluate(context: EvidenceContext) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    securityhub_data = get_cached(
-        context, "securityhub", collect_securityhub, context.session, context.regions
-    )
-    guardduty_data = get_cached(
-        context, "guardduty", collect_guardduty, context.session, context.regions
-    )
-    inspector_data = get_cached(
-        context, "inspector", collect_inspector, context.session, context.regions
-    )
+    securityhub_data = collect(context, "securityhub")
+    guardduty_data = collect(context, "guardduty")
+    inspector_data = collect(context, "inspector")
     gaps: List[str] = []
     errors = (
         securityhub_data["errors"]
