@@ -2,12 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from soc2_scanner.collectors import (
-    collect_backup,
-    collect_config_rules,
-    collect_organizations,
-)
-from soc2_scanner.controls.context import EvidenceContext, get_cached
+from soc2_scanner.controls.context import EvidenceContext, collect
 
 
 CONTROL_ID = "CC5"
@@ -20,13 +15,9 @@ SOURCES = ["AWS Backup", "Organizations", "AWS Config"]
 
 
 def evaluate(context: EvidenceContext) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    backup_data = get_cached(
-        context, "backup", collect_backup, context.session, context.regions
-    )
-    org_data = get_cached(context, "organizations", collect_organizations, context.session)
-    config_rules_data = get_cached(
-        context, "config_rules", collect_config_rules, context.session, context.regions
-    )
+    backup_data = collect(context, "backup")
+    org_data = collect(context, "organizations")
+    config_rules_data = collect(context, "config_rules")
     gaps: List[str] = []
     errors = backup_data["errors"] + org_data["errors"] + config_rules_data["errors"]
 

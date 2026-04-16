@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from soc2_scanner.collectors import collect_cloudtrail, collect_config, collect_ssm
-from soc2_scanner.controls.context import EvidenceContext, get_cached
+from soc2_scanner.controls.context import EvidenceContext, collect
 
 
 CONTROL_ID = "CC7"
@@ -16,11 +15,9 @@ SOURCES = ["AWS Config", "SSM", "CloudTrail"]
 
 
 def evaluate(context: EvidenceContext) -> Tuple[Dict[str, Any], List[str], List[str]]:
-    config_data = get_cached(context, "config", collect_config, context.session, context.regions)
-    ssm_data = get_cached(context, "ssm", collect_ssm, context.session, context.regions)
-    cloudtrail_data = get_cached(
-        context, "cloudtrail", collect_cloudtrail, context.session, context.regions
-    )
+    config_data = collect(context, "config")
+    ssm_data = collect(context, "ssm")
+    cloudtrail_data = collect(context, "cloudtrail")
     gaps: List[str] = []
     errors = config_data["errors"] + ssm_data["errors"] + cloudtrail_data["errors"]
 

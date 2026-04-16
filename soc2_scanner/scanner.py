@@ -28,6 +28,8 @@ class ScanConfig:
     external_id: Optional[str] = None
     external_ids: Dict[str, str] = field(default_factory=dict)
     simulate: bool = False
+    provider: str = "aws"
+    project_id: Optional[str] = None
 
 
 def _utc_timestamp() -> str:
@@ -704,6 +706,244 @@ def _write_pdf_summary(
     return pdf_path
 
 
+def _write_reports(
+    run_dir: str,
+    run_id: str,
+    config: ScanConfig,
+    regions: List[str],
+    identity: Dict[str, Optional[str]],
+    account_results: List[Dict[str, Any]],
+    organization_error: Optional[str],
+    narrative: str,
+) -> Dict[str, Any]:
+    primary_evidence = account_results[0]["evidence"] if account_results else []
+
+    payload = {
+        "generated_at": _utc_timestamp(),
+        "run_id": run_id,
+        "controls": config.controls,
+        "regions": regions,
+        "provider": config.provider,
+        "account_id": identity["account_id"],
+        "caller_arn": identity["arn"],
+        "identity_error": identity["identity_error"],
+        "organization_error": organization_error,
+        "attribution": _report_attribution(),
+        "evidence": primary_evidence,
+        "accounts": account_results if len(account_results) > 1 else [],
+    }
+
+    json_path = os.path.join(run_dir, "evidence.json")
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+
+    csv_path = os.path.join(run_dir, "evidence_summary.csv")
+    summary_rows: List[Dict[str, Any]] = []
+    for account in account_results:
+        for entry in account.get("evidence", []):
+            config_rules = entry.get("data", {}).get("config_rules", {})
+            noncompliant_rules = [
+                rule.get("name")
+                for rule in config_rules.get("rules_sample", [])
+                if rule.get("compliance") == "NON_COMPLIANT"
+            ]
+            noncompliant_rules_sample = ", ".join(noncompliant_rules[:10])
+            summary_rows.append(
+                {
+                    "account_id": account.get("account_id"),
+                    "account_name": account.get("account_name"),
+                    "control_id": entry.get("control_id"),
+                    "title": entry.get("title"),
+                    "status": entry.get("status"),
+                    "gap_count": len(entry.get("gaps", [])),
+                    "error_count": len(entry.get("errors", [])),
+                    "noncompliant_rule_count": config_rules.get("noncompliant_count", 0),
+                    "noncompliant_rules_sample": noncompliant_rules_sample,
+                }
+            )
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(csv_path, index=False)
+
+    hash_path = _write_hash_file(json_path)
+
+    completeness_path = os.path.join(run_dir, "run_completeness.json")
+    completeness_payload = {
+        "run_id": run_id,
+        "generated_at": payload["generated_at"],
+        "provider": config.provider,
+        "account_id": payload["account_id"],
+        "caller_arn": payload["caller_arn"],
+        "regions": regions,
+        "controls": config.controls,
+        "identity_error": payload["identity_error"],
+        "organization_error": organization_error,
+        "account_count": len(account_results),
+        "attribution": _report_attribution(),
+        "narrative": narrative,
+        "artifacts": {
+            "evidence_json": os.path.basename(json_path),
+            "evidence_csv": os.path.basename(csv_path),
+            "evidence_hash": os.path.basename(hash_path),
+        },
+    }
+    with open(completeness_path, "w", encoding="utf-8") as handle:
+        json.dump(completeness_payload, handle, indent=2, sort_keys=True)
+    completeness_hash = _write_hash_file(completeness_path)
+
+    summary_path = os.path.join(run_dir, "report_summary.md")
+    remediation_rule_map = {
+        "securityhub-access-keys-rotated-dcc5e306": (
+            "Rotate or deactivate IAM access keys that exceed your rotation policy. "
+            "Remove unused keys and enforce MFA/SSO for users."
+        )
+    }
+
+    summary_lines = [
+        "# SOC 2 Evidence Summary",
+        "",
+        f"- Run ID: {run_id}",
+        f"- Generated at (UTC): {payload['generated_at']}",
+        f"- Provider: {config.provider.upper()}",
+        f"- Account ID: {payload['account_id']}",
+        f"- Caller ARN: {payload['caller_arn']}",
+        f"- Regions: {', '.join(regions)}",
+        f"- Controls: {', '.join(config.controls)}",
+        f"- Account count: {len(account_results)}",
+        f"- Attribution: {_report_attribution()}",
+        "",
+        "## Notes",
+        completeness_payload["narrative"],
+        "",
+        "## Control Results",
+    ]
+
+    for account in account_results:
+        summary_lines.extend(["", f"### Account {account.get('account_id')}"])
+        if account.get("account_name"):
+            summary_lines.append(f"- Name: {account.get('account_name')}")
+        if account.get("identity_error"):
+            summary_lines.append(f"- Identity error: {account.get('identity_error')}")
+        summary_lines.append("")
+
+        for entry in account.get("evidence", []):
+            summary_lines.extend(
+                [
+                    f"#### {entry.get('control_id')} - {entry.get('title')}",
+                    f"- **Status:** {_format_status_value(entry.get('status', 'unknown'))}",
+                    f"- **Control description:** {entry.get('control_language')}",
+                    f"- Summary: {_control_summary(entry)}",
+                    f"- Collected at: {entry.get('collected_at')}",
+                ]
+            )
+
+            issue_rows = _build_issue_rows(entry, remediation_rule_map)
+            if issue_rows:
+                summary_lines.append("")
+                summary_lines.append("| Type | Finding | Recommendation |")
+                summary_lines.append("| --- | --- | --- |")
+                for row in issue_rows:
+                    summary_lines.append(
+                        f"| {row['type']} | {row['item']} | {row['recommendation']} |"
+                    )
+            summary_lines.append("")
+
+    summary_lines.extend(
+        [
+            "## Artifacts",
+            "- evidence.json",
+            "- evidence_summary.csv",
+            "- evidence.json.sha256",
+            "- run_completeness.json",
+            "- run_completeness.json.sha256",
+        ]
+    )
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(summary_lines).strip() + "\n")
+    summary_hash = _write_hash_file(summary_path)
+    pdf_path = _write_pdf_summary(run_dir, payload, account_results, completeness_payload)
+    pdf_hash = _write_hash_file(pdf_path) if pdf_path else None
+
+    return {
+        "artifacts": [
+            json_path,
+            csv_path,
+            hash_path,
+            completeness_path,
+            completeness_hash,
+            summary_path,
+            summary_hash,
+            *(path for path in [pdf_path, pdf_hash] if path),
+        ],
+        "identity_error": identity["identity_error"],
+    }
+
+
+def _get_gcp_identity() -> Tuple[Any, Dict[str, Optional[str]]]:
+    try:
+        import google.auth  # type: ignore
+    except ImportError as exc:
+        return None, {"account_id": None, "arn": None, "identity_error": str(exc)}
+    try:
+        credentials, project_id = google.auth.default()
+        service_account = getattr(credentials, "service_account_email", None) or str(credentials)
+        return credentials, {
+            "account_id": project_id,
+            "arn": service_account,
+            "identity_error": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return None, {"account_id": None, "arn": None, "identity_error": str(exc)}
+
+
+def _run_gcp_scan(config: ScanConfig) -> Dict[str, Any]:
+    _ensure_output_dir(config.output_dir)
+    run_id = _run_id()
+    run_dir = os.path.join(config.output_dir, run_id)
+    _ensure_output_dir(run_dir)
+
+    credentials, identity = _get_gcp_identity()
+    regions = config.regions or ["global"]
+
+    project_ids: List[str] = []
+    if config.account_ids:
+        project_ids = list(dict.fromkeys(str(pid) for pid in config.account_ids))
+    elif config.project_id:
+        project_ids = [config.project_id]
+    elif identity["account_id"]:
+        project_ids = [identity["account_id"]]
+
+    if not project_ids:
+        project_ids = [""]
+
+    account_results: List[Dict[str, Any]] = []
+    for project_id in project_ids:
+        context = EvidenceContext(
+            session=credentials,
+            regions=regions,
+            provider="gcp",
+            project_id=project_id or None,
+        )
+        evidence_entries = _build_evidence_entries(config.controls, context)
+        account_results.append(
+            {
+                "account_id": project_id,
+                "account_name": None,
+                "caller_arn": identity["arn"],
+                "identity_error": identity["identity_error"],
+                "evidence": evidence_entries,
+            }
+        )
+
+    narrative = (
+        "NON_COMPLIANT values reflect GCP Organization Policy / Security Command "
+        "Center findings, not a direct SOC 2 determination. They are supporting "
+        "evidence that may indicate control gaps and require review."
+    )
+    return _write_reports(
+        run_dir, run_id, config, regions, identity, account_results, None, narrative
+    )
+
+
 def _get_account_identity(session: boto3.Session) -> Dict[str, Optional[str]]:
     try:
         sts = session.client("sts")
@@ -795,6 +1035,8 @@ def _build_evidence_entries(
 def run_scan(config: ScanConfig) -> Dict[str, Any]:
     if config.simulate:
         return _run_simulated_scan(config)
+    if config.provider == "gcp":
+        return _run_gcp_scan(config)
 
     _ensure_output_dir(config.output_dir)
     run_id = _run_id()
@@ -876,169 +1118,12 @@ def run_scan(config: ScanConfig) -> Dict[str, Any]:
             }
         )
 
-    primary_evidence = account_results[0]["evidence"] if account_results else []
-
-    payload = {
-        "generated_at": _utc_timestamp(),
-        "run_id": run_id,
-        "controls": config.controls,
-        "regions": regions,
-        "account_id": identity["account_id"],
-        "caller_arn": identity["arn"],
-        "identity_error": identity["identity_error"],
-        "organization_error": organization_error,
-        "attribution": _report_attribution(),
-        "evidence": primary_evidence,
-        "accounts": account_results if len(account_results) > 1 else [],
-    }
-
-    json_path = os.path.join(run_dir, "evidence.json")
-    with open(json_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-
-    csv_path = os.path.join(run_dir, "evidence_summary.csv")
-    summary_rows: List[Dict[str, Any]] = []
-    for account in account_results:
-        for entry in account.get("evidence", []):
-            config_rules = entry.get("data", {}).get("config_rules", {})
-            noncompliant_rules = [
-                rule.get("name")
-                for rule in config_rules.get("rules_sample", [])
-                if rule.get("compliance") == "NON_COMPLIANT"
-            ]
-            noncompliant_rules_sample = ", ".join(noncompliant_rules[:10])
-            summary_rows.append(
-                {
-                    "account_id": account.get("account_id"),
-                    "account_name": account.get("account_name"),
-                    "control_id": entry.get("control_id"),
-                    "title": entry.get("title"),
-                    "status": entry.get("status"),
-                    "gap_count": len(entry.get("gaps", [])),
-                    "error_count": len(entry.get("errors", [])),
-                    "noncompliant_rule_count": config_rules.get("noncompliant_count", 0),
-                    "noncompliant_rules_sample": noncompliant_rules_sample,
-                }
-            )
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv(csv_path, index=False)
-
-    hash_path = _write_hash_file(json_path)
-
-    completeness_path = os.path.join(run_dir, "run_completeness.json")
-    completeness_payload = {
-        "run_id": run_id,
-        "generated_at": payload["generated_at"],
-        "account_id": payload["account_id"],
-        "caller_arn": payload["caller_arn"],
-        "regions": regions,
-        "controls": config.controls,
-        "identity_error": payload["identity_error"],
-        "organization_error": organization_error,
-        "account_count": len(account_results),
-        "attribution": _report_attribution(),
-        "narrative": (
-            "NON_COMPLIANT values reflect AWS Config/Security Hub rule failures, "
-            "not a direct SOC 2 determination. They are supporting evidence that "
-            "may indicate control gaps and require review."
-        ),
-        "artifacts": {
-            "evidence_json": os.path.basename(json_path),
-            "evidence_csv": os.path.basename(csv_path),
-            "evidence_hash": os.path.basename(hash_path),
-        },
-    }
-    with open(completeness_path, "w", encoding="utf-8") as handle:
-        json.dump(completeness_payload, handle, indent=2, sort_keys=True)
-    completeness_hash = _write_hash_file(completeness_path)
-
-    summary_path = os.path.join(run_dir, "report_summary.md")
-    remediation_rule_map = {
-        "securityhub-access-keys-rotated-dcc5e306": (
-            "Rotate or deactivate IAM access keys that exceed your rotation policy. "
-            "Remove unused keys and enforce MFA/SSO for users."
-        )
-    }
-
-    summary_lines = [
-        "# SOC 2 Evidence Summary",
-        "",
-        f"- Run ID: {run_id}",
-        f"- Generated at (UTC): {payload['generated_at']}",
-        f"- Account ID: {payload['account_id']}",
-        f"- Caller ARN: {payload['caller_arn']}",
-        f"- Regions: {', '.join(regions)}",
-        f"- Controls: {', '.join(config.controls)}",
-        f"- Account count: {len(account_results)}",
-        f"- Attribution: {_report_attribution()}",
-        "",
-        "## Notes",
-        completeness_payload["narrative"],
-        "",
-        "## Control Results",
-    ]
-
-    for account in account_results:
-        summary_lines.extend(
-            [
-                "",
-                f"### Account {account.get('account_id')}",
-            ]
-        )
-        if account.get("account_name"):
-            summary_lines.append(f"- Name: {account.get('account_name')}")
-        if account.get("identity_error"):
-            summary_lines.append(f"- Identity error: {account.get('identity_error')}")
-        summary_lines.append("")
-
-        for entry in account.get("evidence", []):
-            summary_lines.extend(
-                [
-                    f"#### {entry.get('control_id')} - {entry.get('title')}",
-                    f"- **Status:** {_format_status_value(entry.get('status', 'unknown'))}",
-                    f"- **Control description:** {entry.get('control_language')}",
-                    f"- Summary: {_control_summary(entry)}",
-                    f"- Collected at: {entry.get('collected_at')}",
-                ]
-            )
-
-            issue_rows = _build_issue_rows(entry, remediation_rule_map)
-            if issue_rows:
-                summary_lines.append("")
-                summary_lines.append("| Type | Finding | Recommendation |")
-                summary_lines.append("| --- | --- | --- |")
-                for row in issue_rows:
-                    summary_lines.append(
-                        f"| {row['type']} | {row['item']} | {row['recommendation']} |"
-                    )
-            summary_lines.append("")
-
-    summary_lines.extend(
-        [
-            "## Artifacts",
-            f"- evidence.json",
-            f"- evidence_summary.csv",
-            f"- evidence.json.sha256",
-            f"- run_completeness.json",
-            f"- run_completeness.json.sha256",
-        ]
+    narrative = (
+        "NON_COMPLIANT values reflect AWS Config/Security Hub rule failures, "
+        "not a direct SOC 2 determination. They are supporting evidence that "
+        "may indicate control gaps and require review."
     )
-    with open(summary_path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(summary_lines).strip() + "\n")
-    summary_hash = _write_hash_file(summary_path)
-    pdf_path = _write_pdf_summary(run_dir, payload, account_results, completeness_payload)
-    pdf_hash = _write_hash_file(pdf_path) if pdf_path else None
-
-    return {
-        "artifacts": [
-            json_path,
-            csv_path,
-            hash_path,
-            completeness_path,
-            completeness_hash,
-            summary_path,
-            summary_hash,
-            *(path for path in [pdf_path, pdf_hash] if path),
-        ],
-        "identity_error": identity["identity_error"],
-    }
+    return _write_reports(
+        run_dir, run_id, config, regions, identity, account_results,
+        organization_error, narrative,
+    )
